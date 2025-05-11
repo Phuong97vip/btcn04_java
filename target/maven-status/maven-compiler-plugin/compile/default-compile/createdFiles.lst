@@ -1,4 +1,5 @@
 com\chatapp\client\ChatPanel.class
+com\chatapp\client\ChatWindow$1.class
 com\chatapp\client\ChatWindow.class
 com\chatapp\client\LoginWindow.class
 com\chatapp\client\ChatClient.class

@@ -14,6 +14,7 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
 import javax.swing.DefaultListModel;
+import javax.swing.JOptionPane;
 
 public class ChatClient {
     private static final String SERVER_HOST = "localhost";
@@ -81,6 +82,15 @@ public class ChatClient {
             case "GROUP_LIST":
                 handleGroupList(data);
                 break;
+            case "GROUP_ADDED":
+                handleGroupAdded(data);
+                break;
+            case "GROUP_MEMBER_ADDED":
+                handleGroupMemberAdded(data);
+                break;
+            case "GROUP_MEMBERS":
+                handleGroupMembers(data);
+                break;
             case "MESSAGE":
                 handlePrivateMessage(data);
                 break;
@@ -106,6 +116,9 @@ public class ChatClient {
         loginWindow.dispose();
         chatWindow = new ChatWindow(this, username);
         chatWindow.setVisible(true);
+        
+        // Request group list after successful login
+        sendMessage("GET_GROUPS");
     }
 
     private void handleUserList(String data) {
@@ -119,10 +132,46 @@ public class ChatClient {
         for (String group : groups) {
             if (!group.isEmpty()) {
                 String[] parts = group.split(":");
-                groupListModel.addElement(parts[0]);
+                if (parts.length > 0) {
+                    String groupId = parts[0];
+                    if (!groupListModel.contains(groupId)) {
+                        groupListModel.addElement(groupId);
+                    }
+                }
             }
         }
-        chatWindow.updateGroupList(groupListModel);
+        if (chatWindow != null) {
+            chatWindow.updateGroupList(groupListModel);
+            // Request chat history for each group
+            for (int i = 0; i < groupListModel.size(); i++) {
+                String groupId = groupListModel.get(i);
+                sendMessage("GROUP_HISTORY:" + groupId);
+            }
+        }
+    }
+
+    private void handleGroupAdded(String groupId) {
+        if (chatWindow != null) {
+            chatWindow.addGroup(groupId);
+        }
+    }
+
+    private void handleGroupMemberAdded(String data) {
+        String[] parts = data.split(":");
+        String groupId = parts[0];
+        String newMember = parts[1];
+        if (chatWindow != null) {
+            chatWindow.addGroupMember(groupId, newMember);
+        }
+    }
+
+    private void handleGroupMembers(String data) {
+        String[] parts = data.split(":", 2);
+        String groupId = parts[0];
+        String[] members = parts[1].split(",");
+        if (chatWindow != null) {
+            chatWindow.updateGroupMembers(groupId, members);
+        }
     }
 
     private void handlePrivateMessage(String data) {
@@ -176,9 +225,10 @@ public class ChatClient {
 
     public void sendFile(String target, File file, boolean isGroup) {
         try {
-            // Send file metadata
-            String command = isGroup ? "GROUP_FILE:" : "PRIVATE_FILE:";
+            // Send file metadata first
+            String command = isGroup ? "GROUP_FILE:" : "FILE:";
             out.println(command + target + ":" + file.getName());
+            out.flush(); // Ensure metadata is sent before file content
 
             // Send file content
             FileInputStream fis = new FileInputStream(file);
@@ -190,8 +240,16 @@ public class ChatClient {
             }
             os.flush();
             fis.close();
+
+            // Send end marker
+            out.println("FILE_END");
+            out.flush();
         } catch (IOException e) {
             e.printStackTrace();
+            JOptionPane.showMessageDialog(null, 
+                "Error sending file: " + e.getMessage(),
+                "Error", 
+                JOptionPane.ERROR_MESSAGE);
         }
     }
 

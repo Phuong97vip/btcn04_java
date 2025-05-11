@@ -17,8 +17,6 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.locks.ReentrantLock;
 
-import org.apache.commons.io.FileUtils;
-
 import com.opencsv.CSVReader;
 import com.opencsv.CSVWriter;
 import com.opencsv.exceptions.CsvValidationException;
@@ -36,6 +34,8 @@ public class ChatServer {
     private Map<String, Set<String>> groupMembers; // groupId -> Set of usernames
     private ExecutorService threadPool;
     private ReentrantLock fileLock;
+    private Map<String, Set<String>> sentMessages = new ConcurrentHashMap<>();
+    private Map<String, Long> lastMessageTime = new ConcurrentHashMap<>();
 
     public ChatServer() {
         onlineUsers = new ConcurrentHashMap<>();
@@ -48,34 +48,98 @@ public class ChatServer {
 
     private void createRequiredFiles() {
         try {
-            FileUtils.forceMkdir(new File(SERVER_FILES_DIR));
-            createFileIfNotExists(USERS_FILE);
-            createFileIfNotExists(MESSAGES_FILE);
-            createFileIfNotExists(GROUP_MESSAGES_FILE);
-            createFileIfNotExists(GROUPS_FILE);
+            // Create files if they don't exist
+            File usersFile = new File(USERS_FILE);
+            File messagesFile = new File(MESSAGES_FILE);
+            File groupMessagesFile = new File(GROUP_MESSAGES_FILE);
+            File groupsFile = new File(GROUPS_FILE);
+            File serverFilesDir = new File(SERVER_FILES_DIR);
+            
+            if (!usersFile.exists()) {
+                usersFile.createNewFile();
+                // Add header line to users.csv
+                CSVWriter writer = new CSVWriter(new FileWriter(usersFile));
+                writer.writeNext(new String[]{"username", "password"});
+                writer.close();
+            }
+            
+            if (!messagesFile.exists()) {
+                messagesFile.createNewFile();
+                // Add header line to messages.csv
+                CSVWriter writer = new CSVWriter(new FileWriter(messagesFile));
+                writer.writeNext(new String[]{"sender", "receiver", "message", "timestamp", "deleted_by"});
+                writer.close();
+            }
+            
+            if (!groupMessagesFile.exists()) {
+                groupMessagesFile.createNewFile();
+                // Add header line to group_messages.csv
+                CSVWriter writer = new CSVWriter(new FileWriter(groupMessagesFile));
+                writer.writeNext(new String[]{"group_id", "sender", "message", "timestamp", "deleted_by"});
+                writer.close();
+            }
+            
+            if (!groupsFile.exists()) {
+                groupsFile.createNewFile();
+                // Add header line to groups.csv
+                CSVWriter writer = new CSVWriter(new FileWriter(groupsFile));
+                writer.writeNext(new String[]{"group_id", "members"});
+                writer.close();
+            }
+            
+            if (!serverFilesDir.exists()) {
+                serverFilesDir.mkdir();
+            }
         } catch (IOException e) {
             e.printStackTrace();
-        }
-    }
-
-    private void createFileIfNotExists(String filename) throws IOException {
-        File file = new File(filename);
-        if (!file.exists()) {
-            file.createNewFile();
+            System.exit(1);
         }
     }
 
     private void loadGroups() {
         fileLock.lock();
         try {
-            CSVReader reader = new CSVReader(new FileReader(GROUPS_FILE));
-            String[] record;
-            while ((record = reader.readNext()) != null) {
-                String groupId = record[0];
-                String[] members = record[1].split(",");
-                groupMembers.put(groupId, new HashSet<>(Arrays.asList(members)));
+            // Load từ GROUPS_FILE
+            File groupsFile = new File(GROUPS_FILE);
+            if (groupsFile.exists() && groupsFile.length() > 0) {
+                CSVReader reader = new CSVReader(new FileReader(GROUPS_FILE));
+                String[] record;
+                while ((record = reader.readNext()) != null) {
+                    if (record.length >= 2) {
+                        String groupId = record[0];
+                        String[] members = record[1].split(",");
+                        groupMembers.put(groupId, new HashSet<>(Arrays.asList(members)));
+                    }
+                }
+                reader.close();
             }
-            reader.close();
+
+            // Load từ GROUP_MESSAGES_FILE để đảm bảo không bỏ sót group nào
+            File messagesFile = new File(GROUP_MESSAGES_FILE);
+            if (messagesFile.exists() && messagesFile.length() > 0) {
+                CSVReader reader = new CSVReader(new FileReader(GROUP_MESSAGES_FILE));
+                String[] record;
+                while ((record = reader.readNext()) != null) {
+                    if (record.length >= 2) {
+                        String groupId = record[0];
+                        String sender = record[1];
+                        
+                        // Thêm group và sender vào groupMembers nếu chưa tồn tại
+                        Set<String> members = groupMembers.computeIfAbsent(groupId, k -> new HashSet<>());
+                        members.add(sender);
+                    }
+                }
+                reader.close();
+            }
+
+            // Cập nhật lại GROUPS_FILE với thông tin mới nhất
+            CSVWriter writer = new CSVWriter(new FileWriter(GROUPS_FILE, false));
+            for (Map.Entry<String, Set<String>> entry : groupMembers.entrySet()) {
+                String[] record = {entry.getKey(), String.join(",", entry.getValue())};
+                writer.writeNext(record);
+            }
+            writer.close();
+
         } catch (IOException | CsvValidationException e) {
             e.printStackTrace();
         } finally {
@@ -102,15 +166,47 @@ public class ChatServer {
         members.add(creator);
         groupMembers.put(groupId, members);
         saveGroup(groupId, members);
+        
+        // Thông báo cho creator về group mới
+        ClientHandler creatorClient = onlineUsers.get(creator);
+        if (creatorClient != null) {
+            creatorClient.sendMessage("GROUP_CREATED:" + groupId);
+        }
+        
         broadcastGroupList();
     }
 
     public void addMemberToGroup(String groupId, String username) {
-        Set<String> members = groupMembers.get(groupId);
-        if (members != null) {
-            members.add(username);
-            updateGroupFile(groupId, members);
-            broadcastGroupList();
+        fileLock.lock();
+        try {
+            Set<String> members = groupMembers.get(groupId);
+            if (members != null) {
+                members.add(username);
+                updateGroupFile(groupId, members);
+                broadcastGroupList();
+                
+                // Thông báo cho user được thêm vào group
+                ClientHandler newMemberClient = onlineUsers.get(username);
+                if (newMemberClient != null) {
+                    newMemberClient.sendMessage("GROUP_ADDED:" + groupId);
+                    // Gửi danh sách thành viên cho thành viên mới
+                    handleGetGroupMembers(groupId, newMemberClient);
+                }
+                
+                // Thông báo cho các thành viên khác
+                for (String member : members) {
+                    if (!member.equals(username)) {
+                        ClientHandler memberClient = onlineUsers.get(member);
+                        if (memberClient != null) {
+                            memberClient.sendMessage("GROUP_MEMBER_ADDED:" + groupId + ":" + username);
+                            // Cập nhật danh sách thành viên cho tất cả
+                            handleGetGroupMembers(groupId, memberClient);
+                        }
+                    }
+                }
+            }
+        } finally {
+            fileLock.unlock();
         }
     }
 
@@ -157,31 +253,54 @@ public class ChatServer {
     }
 
     public void broadcastGroupList() {
-        StringBuilder groupList = new StringBuilder();
-        for (Map.Entry<String, Set<String>> entry : groupMembers.entrySet()) {
-            if (groupList.length() > 0) {
-                groupList.append(";");
-            }
-            groupList.append(entry.getKey()).append(":").append(String.join(",", entry.getValue()));
-        }
-        
         for (ClientHandler client : onlineUsers.values()) {
-            client.sendMessage("GROUP_LIST:" + groupList.toString());
+            String username = client.getUsername();
+            // Chỉ gửi danh sách group mà user là thành viên
+            StringBuilder userGroups = new StringBuilder();
+            for (Map.Entry<String, Set<String>> entry : groupMembers.entrySet()) {
+                if (entry.getValue().contains(username)) {
+                    if (userGroups.length() > 0) {
+                        userGroups.append(";");
+                    }
+                    userGroups.append(entry.getKey()).append(":").append(String.join(",", entry.getValue()));
+                }
+            }
+            client.sendMessage("GROUP_LIST:" + userGroups.toString());
         }
     }
 
     public void sendGroupMessage(String groupId, String sender, String message) {
         Set<String> members = groupMembers.get(groupId);
         if (members != null) {
+            // Tạo message ID duy nhất với timestamp
+            long currentTime = System.currentTimeMillis();
+            String messageId = groupId + ":" + sender + ":" + message;
+            
+            // Kiểm tra thời gian giữa các tin nhắn
+            Long lastTime = lastMessageTime.get(messageId);
+            if (lastTime != null && currentTime - lastTime < 1000) { // Nếu tin nhắn được gửi trong vòng 1 giây
+                return; // Bỏ qua tin nhắn trùng lặp
+            }
+            
+            // Cập nhật thời gian gửi tin nhắn
+            lastMessageTime.put(messageId, currentTime);
+            
+            // Lưu tin nhắn vào CSV
+            saveGroupMessage(groupId, sender, message);
+            
+            // Gửi tin nhắn cho tất cả thành viên trong group
             for (String member : members) {
-                if (!member.equals(sender)) {
-                    ClientHandler memberClient = onlineUsers.get(member);
-                    if (memberClient != null) {
+                ClientHandler memberClient = onlineUsers.get(member);
+                if (memberClient != null) {
+                    // Nếu là người gửi, gửi với prefix "YOU"
+                    if (member.equals(sender)) {
+                        memberClient.sendMessage("GROUP:" + groupId + ":YOU:" + message);
+                    } else {
+                        // Nếu là người nhận khác, gửi với tên người gửi
                         memberClient.sendMessage("GROUP:" + groupId + ":" + sender + ":" + message);
                     }
                 }
             }
-            saveGroupMessage(groupId, sender, message);
         }
     }
 
@@ -437,6 +556,19 @@ public class ChatServer {
                 writer.writeNext(message);
             }
             writer.close();
+
+            // Thông báo cho các thành viên khác trong group
+            Set<String> members = groupMembers.get(groupId);
+            if (members != null) {
+                for (String member : members) {
+                    if (!member.equals(username)) {
+                        ClientHandler memberClient = onlineUsers.get(member);
+                        if (memberClient != null) {
+                            memberClient.sendMessage("GROUP:" + groupId + ":" + username + ":Chat history has been cleared by " + username);
+                        }
+                    }
+                }
+            }
         } catch (IOException | CsvValidationException e) {
             e.printStackTrace();
         } finally {
@@ -459,8 +591,8 @@ public class ChatServer {
                 String deletedBy = record.length > 4 ? record[4] : "";
 
                 // Nếu là tin nhắn cần xóa
-                if ((sender.equals(user1) && receiver.equals(user2) || 
-                     sender.equals(user2) && receiver.equals(user1)) && 
+                if (((sender.equals(user1) && receiver.equals(user2)) || 
+                     (sender.equals(user2) && receiver.equals(user1))) && 
                     msg.equals(message)) {
                     // Thêm user1 vào danh sách đã xóa
                     if (!deletedBy.contains(user1)) {
@@ -526,6 +658,33 @@ public class ChatServer {
         } finally {
             fileLock.unlock();
         }
+    }
+
+    public void handleGetGroupMembers(String groupId, ClientHandler client) {
+        fileLock.lock();
+        try {
+            Set<String> members = groupMembers.get(groupId);
+            if (members != null) {
+                String memberList = String.join(",", members);
+                client.sendMessage("GROUP_MEMBERS:" + groupId + ":" + memberList);
+            }
+        } finally {
+            fileLock.unlock();
+        }
+    }
+
+    public void sendGroupListToUser(ClientHandler client) {
+        String username = client.getUsername();
+        StringBuilder userGroups = new StringBuilder();
+        for (Map.Entry<String, Set<String>> entry : groupMembers.entrySet()) {
+            if (entry.getValue().contains(username)) {
+                if (userGroups.length() > 0) {
+                    userGroups.append(";");
+                }
+                userGroups.append(entry.getKey()).append(":").append(String.join(",", entry.getValue()));
+            }
+        }
+        client.sendMessage("GROUP_LIST:" + userGroups.toString());
     }
 
     public static void main(String[] args) {

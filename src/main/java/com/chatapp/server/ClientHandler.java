@@ -53,6 +53,9 @@ public class ClientHandler implements Runnable {
         String content = parts[1];
 
         switch (command) {
+            case "GET_GROUPS":
+                server.sendGroupListToUser(this);
+                break;
             case "MESSAGE":
                 String[] messageParts = content.split(":", 2);
                 if (messageParts.length == 2) {
@@ -133,6 +136,9 @@ public class ClientHandler implements Runnable {
             case "GROUP_MESSAGE":
                 handleGroupMessage(content);
                 break;
+            case "FILE_TRANSFER":
+                handleFileTransfer(content);
+                break;
             default:
                 System.out.println("Unknown command: " + command);
         }
@@ -197,23 +203,34 @@ public class ClientHandler implements Runnable {
                     serverDir.mkdir();
                 }
                 
+                // Tạo tên file duy nhất bằng cách thêm timestamp
+                String uniqueFileName = System.currentTimeMillis() + "_" + fileName;
+                String filePath = "server_files/" + uniqueFileName;
+                String absoluteFilePath = new File(filePath).getAbsolutePath();
+                
                 // Lưu file vào thư mục server_files
-                String filePath = "server_files/" + fileName;
                 FileOutputStream fos = new FileOutputStream(filePath);
                 fos.write(fileData, 0, bytesRead);
                 fos.close();
-                
-                // Gửi thông báo cho người nhận
-                if (target.startsWith("GROUP_")) {
-                    // Gửi file cho group
-                    server.sendGroupFile(target, username, fileName, filePath);
+
+                // Đọc end marker
+                String endMarker = in.readLine();
+                if ("FILE_END".equals(endMarker)) {
+                    // Gửi thông báo cho người nhận
+                    if (target.startsWith("GROUP_")) {
+                        // Gửi file cho group
+                        server.sendGroupFile(target, username, fileName, absoluteFilePath);
+                    } else {
+                        // Gửi file cho user
+                        server.sendPrivateFile(username, target, fileName, absoluteFilePath);
+                    }
                 } else {
-                    // Gửi file cho user
-                    server.sendPrivateFile(username, target, fileName, filePath);
+                    System.out.println("Error: File transfer did not end properly");
                 }
             }
         } catch (IOException e) {
             e.printStackTrace();
+            out.println("ERROR:Failed to transfer file: " + e.getMessage());
         }
     }
 
